@@ -1,0 +1,10 @@
+src/kern/conf/ASST3
+src/kern/fs/sfs
+src/kern/include/file.h
+src/kern/include/kern/sfs.h
+src/kern/include/sfs.h
+src/kern/syscall/file.c
+src/user/bin/psh
+src/user/sbin/dumpsfs
+src/user/sbin/mksfs
+src/user/sbin/sfsck

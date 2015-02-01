@@ -1,0 +1,125 @@
+|-----------------------------------------------------------------------------|
+| TOTAL      (Out of 100)                                              |  82  |
+|----------------------------------------------------------------------+------|
+| Task 1     (Out of  20)                                              |  19  |
+|----------------------------------------------------------------------+------|
+| Task 2     (Out of  20)                                              |  15  |
+|----------------------------------------------------------------------+------|
+| Task 3     (Out of  30)                                              |  22  |
+|----------------------------------------------------------------------+------|
+| Style      (Out of  15)                                              |  14  |
+|----------------------------------------------------------------------+------|
+| Interview  (Out of  15)                                              |  12  |
+|-----------------------------------------------------------------------------|
+
+
+|-----------------------------------------------------------------------------|
+| Task 1 (Out of 20)                                                   |  19  |
+|----------------------------------------------------------------------+------|
+| `testbin/argtest` works with 0-4 arguments having different lengths  |  5   |
+|----------------------------------------------------------------------+------|
+| `testbin/add` works with 2 arguments, with varying numbers of digits |  5   |
+|----------------------------------------------------------------------+------|
+| correctly copies strings, records start user address, and copies     |      |
+| pointers for `argv` array, including alignment and NULL termination  |  5   |
+|----------------------------------------------------------------------+------|
+| frees args and any other `kmalloc`'d memory before going to user     |      |
+| mode, checks for errors from `kmalloc`, `copyout`, etc. and cleans   |      |
+| up on error return                                                   |  4   |
+|-----------------------------------------------------------------------------|
+| *Comments*                                                                  |
+|   - you need to free the `argv` array itself as well, right now, you're     |
+|     just freeing the individual arguments.                                  |
+|-----------------------------------------------------------------------------|
+
+
+|-----------------------------------------------------------------------------|
+| Task 2 (Out of 20)                                                   |  15  |
+|----------------------------------------------------------------------+------|
+| `waittest` 1-5 completes correctly                                   |  10  |
+|----------------------------------------------------------------------+------|
+| `menu thread` waits for child and "&" is supported                   |  0   |
+|----------------------------------------------------------------------+------|
+| `pid_join` / `pid_detach` / `pid_exit` work together appropriately,  |      |
+| check for errors and return reasonable error codes, and ensure       |      |
+| pidinfo struct is freed after last join finishes, or at detach if    |      |
+| there are no joiners                                                 |  5   |
+|-----------------------------------------------------------------------------|
+| *Comments*                                                                  |
+|    - You guys are just dropping the terminal '&' in `cmd_progthread`.       |
+|-----------------------------------------------------------------------------|
+
+
+|-----------------------------------------------------------------------------|
+| Task 3 (Out of 30)                                                   |  22  |
+|----------------------------------------------------------------------+------|
+| `waitpid` handles bad args from user and returns correct error codes |  4   |
+|----------------------------------------------------------------------+------|
+| `waitpid` gets correct exitstatus from child, handles `WNOHANG`      |  2   |
+|----------------------------------------------------------------------+------|
+| `getpid` returns correct value, `curthread->t_pid`                   |  4   |
+|----------------------------------------------------------------------+------|
+| `waitpid` returns correct values, using `copyout` to store into user |      |
+| pointer status, and returns correct and error codes                  |  0   |
+|----------------------------------------------------------------------+------|
+| `kill` handles bad args from user and returns correct error codes    |  1   |
+|----------------------------------------------------------------------+------|
+| `SIGKILL`, `SIGHUP`, `SIGINT`, `SIGTERM` terminate child process     |      |
+| that is in infinite loop                                             |  4   |
+|----------------------------------------------------------------------+------|
+| `SIGWINCH`, `SIGINFO` have no observable effect, appear ignored      |  1   |
+|----------------------------------------------------------------------+------|
+| `SIGSTOP` and `SIGCONT` sent to siblings have expected effect        |  3   |
+|----------------------------------------------------------------------+------|
+| `kill` sets flags in `pidinfo` struct for target thread              |  1   |
+|----------------------------------------------------------------------+------|
+| `SIGCONT` wakes up target when signal is sent                        |  1   |
+|----------------------------------------------------------------------+------|
+| threads check own signals before returning to userspace in           |      |
+| `mips_trap`                                                          |  1   |
+|----------------------------------------------------------------------+------|
+| `SIGSTOP` / `SIGCONT` use new condition variable in `pidinfo`        |      |
+| struct, not sharing same condition used by `pid_join` / `pid_exit`   |      |
+| or some ad hoc synchronization strategy                              |  0   |
+|-----------------------------------------------------------------------------|
+| *Comments*                                                                  |
+|   - `p testbin/badcall b` gives me:                                         |
+|       >> unexpected result -1 from waitpid, status 0.:Bad memory reference' |
+|   - `status` needs to be a `userptr_t` not an `int *`                       |
+|   - `kill` does not return correct exit status???                           |
+|       - e.g. `EUNIMP` for `SIGKILL`                                         |
+|   - Don't use `pi_cv` to wait for `SIGSTOP`                                 |
+|-----------------------------------------------------------------------------|
+
+
+
+|-----------------------------------------------------------------------------|
+| Style (Out of 15)                                                    |  14  |
+|----------------------------------------------------------------------+------|
+| Code compiles cleanly with no warnings                               |  3   |
+|----------------------------------------------------------------------+------|
+| All new calls use appropriate functions from the PID module          |  3   |
+|----------------------------------------------------------------------+------|
+| Error handling frees any allocated objects that are no longer needed |  3   |
+|----------------------------------------------------------------------+------|
+| New code is clean, commented, and easy to read                       |  5   |
+|-----------------------------------------------------------------------------|
+| *Comments*                                                                  |
+|   - Need to free `argv` as well .                                           |
+|-----------------------------------------------------------------------------|
+
+
+|-----------------------------------------------------------------------------|
+| Interview (Out of 15)                                                |  12  |
+|-----------------------------------------------------------------------------|
+
+
+|-----------------------------------------------------------------------------|
+| *Comments*                                                                  |
+| (Just things to be wary of, nothing that will cost you marks)               |
+|-----------------------------------------------------------------------------|
+|   - Code, especially in runprogram, is a bit cramped. Use whitespace to     |
+|     mark logical blocks of code so that it's easy to read.                  |
+|   - `lock_acquire` called too early: see post on forum.                     |
+|   - Code can deadlock: see post on forum.                                   |
+|-----------------------------------------------------------------------------|

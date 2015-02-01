@@ -1,0 +1,20 @@
+This directory contains a full a3 starter code tree, under src/ as well as
+files needed to incorporate the new file system code into an existing A1 or
+A2 solution.  The files are briefly described here:
+
+a3-new-files.txt: A list of completely new files and directories for a3. When
+   a new directory has been added, only the directory is listed, not all the
+   files that it contains.
+
+a3-new-files.tgz: A gzip'd tar archive of the new files and directories for a3.
+
+a3-patched-files-against-a1.txt: A list of files that will be affected by 
+   applying the patches to an a1 starter code base.
+
+a3-patches-against-a1: The patches themselves
+
+
+a3-patched-files-against-a2.txt: A list of files that will be affected by 
+   applying the patches to an a2 starter code base.
+
+a3-patches-against-a2: The patches themselves

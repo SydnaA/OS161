@@ -1,0 +1,38 @@
+Design Document
+
+1. Explain how your open file table design supports the fork semantics.
+	We create a new struct called fd which is our filetable structure 
+that includes a flag, a reference counter, a lock, the offset and a vnode.
+
+	Because thread_fork do not share memory or open file tables, 
+we have to call filetable_copy inside of thread_fork.
+Filetable_copy copies everything from parent's filetable into child's filetable, 
+and then we increment the parent's reference counter to indicate there 
+is a child process.
+
+	When the process exits, we need to check does the filetable exists, 
+if exists, we need to destroy the filetable
+
+2. Explain your implementation of sfs_getdirentry.
+	We first go to the offset and then start reading from the offset till
+end of the directory entries. If the slots is less than entries we increments
+the slot index by 1 and set it to the offset and finally also move the name into the uio.
+3. Explain what changes you needed to make to use wasted inode space to store file data.
+	We omitted this portion.
+4. Discuss the single biggest challenge you had to address for the assignment.
+	1. We encountered many obstacles which we had to overcome to finish 
+this assignment. One of the biggest challenges we had to address is the
+decision on whether we should do the bonus (sfs_getdirentry and SFS inodes) or not. 
+It is already 1:44pm and time is closing on us. We could not decide whether
+to spend the time debugging our work or continuing on with bonus.
+After a long strategic group discussion we realized we only have enough
+resources to only finish sfs_getdirentry; therefore forfeiting the SFS inodes.
+	2. Another challenge will be when system fork out the process, 
+system will also increment the ref counter for the parent's filetable. 
+Since we don't merge our A2 code, we have no way to decrement the ref counter
+in the parent's filetable to let parent process know the child already exists.
+	3. When we run badcall on lseek, it crash the kernel after the fork.
+But all other test in badcall are sucessfully passed.
+	
+Thank you very much for everything. :)
+		

@@ -1,0 +1,2256 @@
+diff -aur ../a1-starter/src/kern/arch/mips/conf/conf.arch src/kern/arch/mips/conf/conf.arch
+--- ../a1-starter/src/kern/arch/mips/conf/conf.arch	2013-01-18 08:41:30.000000000 -0500
++++ src/kern/arch/mips/conf/conf.arch	2013-03-13 00:59:06.000000000 -0400
+@@ -72,6 +72,10 @@
+ defoption   dumbvm
+ machine mips optfile dumbvm    arch/mips/vm/dumbvm.c
+ 
++# Machine-dependent parts of the real VM system
++machine mips optofffile dumbvm arch/mips/vm/coremap.c
++machine mips optofffile dumbvm arch/mips/vm/vm.c
++
+ #
+ # System call layer
+ #
+Only in src/kern/arch/mips/include: coremap.h
+diff -aur ../a1-starter/src/kern/arch/mips/include/vm.h src/kern/arch/mips/include/vm.h
+--- ../a1-starter/src/kern/arch/mips/include/vm.h	2013-01-18 08:41:29.000000000 -0500
++++ src/kern/arch/mips/include/vm.h	2013-03-13 00:59:06.000000000 -0400
+@@ -66,6 +66,7 @@
+  * a valid address, and will make a *huge* mess if you scribble on it.
+  */
+ #define PADDR_TO_KVADDR(paddr) ((paddr)+MIPS_KSEG0)
++#define KVADDR_TO_PADDR(vaddr) ((vaddr)-MIPS_KSEG0)
+ 
+ /*
+  * The top of user space. (Actually, the address immediately above the
+@@ -83,6 +84,11 @@
+  */
+ #define USERSTACK     USERSPACETOP
+ 
++/* Give each user process a 2MB stack with a 64k redzone under it. */
++#define USERSTACKSIZE	(512*PAGE_SIZE)
++#define USERSTACKBASE	(USERSTACK-USERSTACKSIZE)
++#define USERSTACKREDZONE	65536
++
+ /*
+  * Interface to the low-level module that looks after the amount of
+  * physical memory we have.
+@@ -103,16 +109,36 @@
+ void ram_getsize(paddr_t *lo, paddr_t *hi);
+ 
+ /*
++ * Machine-dependent per-CPU data
++ */
++
++struct cpu_vm_machdep {
++	/* last address space loaded into MMU */
++	struct addrspace *cvm_lastas;
++
++	/* if < NUM_TLB, next TLB entry to use (when TLB not yet full) */
++	uint32_t cvm_nexttlb;
++	/* for OPT_SEQTLB, next TLB entry to use (after TLB full) */
++	uint32_t cvm_tlbseqslot;
++};
++
++void cpu_vm_machdep_init(struct cpu_vm_machdep *cvm);
++void cpu_vm_machdep_cleanup(struct cpu_vm_machdep *cvm);
++
++/*
+  * TLB shootdown bits.
+  *
+  * We'll take up to 16 invalidations before just flushing the whole TLB.
++ *
++ * Note that because IPI delivery isn't instantaneous, we may
++ * sometimes end up flushing out a translation other than the one
++ * someone wanted gone, unless we check that the coremap index
++ * matches.
+  */
+ 
+ struct tlbshootdown {
+-	/*
+-	 * Change this to what you need for your VM design.
+-	 */
+-	int ts_placeholder;
++	int ts_tlbix;
++	unsigned ts_coremapindex;
+ };
+ 
+ #define TLBSHOOTDOWN_MAX 16
+diff -aur ../a1-starter/src/kern/arch/mips/syscall/syscall.c src/kern/arch/mips/syscall/syscall.c
+--- ../a1-starter/src/kern/arch/mips/syscall/syscall.c	2013-01-18 08:41:30.000000000 -0500
++++ src/kern/arch/mips/syscall/syscall.c	2013-03-13 00:59:06.000000000 -0400
+@@ -36,7 +36,7 @@
+ #include <current.h>
+ #include <syscall.h>
+ #include <kern/wait.h> /* New include of wait macros for _exit */
+-
++#include <copyinout.h> /* A3 SETUP - new include for lseek */
+ /*
+  * System call dispatcher.
+  *
+@@ -81,6 +81,14 @@
+ 	int callno;
+ 	int32_t retval;
+ 	int err;
++	/* BEGIN A3 SETUP */
++	/* lseek uses a 64-bit argument, and has a 64-bit return type,
++	 * which needs special handling.
++	 */
++	int whence;
++	off_t pos;
++	off_t retval64 = 0;
++	/* END A3 SETUP */
+ 
+ 	KASSERT(curthread != NULL);
+ 	KASSERT(curthread->t_curspl == 0);
+@@ -109,7 +117,7 @@
+ 				     (userptr_t)tf->tf_a1);
+ 		    break;
+ 
+-            /* ASST1: These implementations of read and write only work for
++            /* ASST2: These implementations of read and write only work for
+              * console I/O (stdin, stdout and stderr file descriptors)
+              */
+             case SYS_read:
+@@ -134,15 +142,56 @@
+ 		    err = sys_fork(tf, &retval);
+ 		    break;
+ 
+-            /* ASST1 - You need to fill in the code for each of these cases */
++            /* ASST2 - You need to fill in the code for each of these cases */
+             case SYS_getpid:
+-
+             case SYS_waitpid:
+-
+             case SYS_kill:
+ 
+ 
+ 	    /* Even more system calls will go here */
++
++	    /* BEGIN A3 SETUP */
++           
++            /* Note: SYS_read and SYS_write are above, from A1 starter code.*/
++		 
++	    case SYS_open:
++		err = sys_open((userptr_t)tf->tf_a0, tf->tf_a1, tf->tf_a2, 
++			       &retval);
++		break;
++	    case SYS_close:
++		err = sys_close(tf->tf_a0);
++		break;
++	    case SYS_dup2:
++		err = sys_dup2(tf->tf_a0, tf->tf_a1, &retval);
++		break;
++	    case SYS_lseek:
++		    /* Ouch ... off_t is 64-bit, so need a2/a3 register
++		     * pair to get the "pos" argument and need to get 
++		     * last argument "whence" off the user stack with 
++		     * copyout.
++		     */
++		pos = ((off_t)tf->tf_a2 << 32) | tf->tf_a3;
++		err = copyin((userptr_t)(tf->tf_sp+16), &whence, sizeof(int));
++		if (err) {
++			break;
++		}
++		err = sys_lseek(tf->tf_a0, pos, whence, &retval64);
++		break;
++	    case SYS_chdir:
++		err = sys_chdir((userptr_t)tf->tf_a0);
++		break;
++	    case SYS___getcwd:
++		err = sys___getcwd((userptr_t)tf->tf_a0, tf->tf_a1, &retval);
++		break;
++	    case SYS_fstat:
++		err = sys_fstat(tf->tf_a0, (userptr_t)tf->tf_a1);
++		break;
++	    case SYS_getdirentry:
++		err = sys_getdirentry(tf->tf_a0, (userptr_t)tf->tf_a1, 
++				      tf->tf_a2, &retval);
++		break;
++	    
++	    /* END A3 SETUP */
+  
+ 	    default:
+ 		kprintf("Unknown syscall %d\n", callno);
+@@ -162,7 +211,15 @@
+ 	}
+ 	else {
+ 		/* Success. */
+-		tf->tf_v0 = retval;
++		/* BEGIN A3 SETUP */
++		/* lseek needs to return a 64-bit result in v0 and v1 */
++		if (retval64 != 0) {
++			tf->tf_v0 = (int)(retval64 >> 32); /* high bits */
++			tf->tf_v1 = (int)(retval64 & 0xffffffff); /* low bits */
++		} else {
++			tf->tf_v0 = retval;
++		}
++		/* END A3 SETUP */
+ 		tf->tf_a3 = 0;      /* signal no error */
+ 	}
+ 	
+Only in src/kern/arch/mips/vm: coremap.c
+Only in src/kern/arch/mips/vm: vm.c
+Only in ../a1-starter/src/kern/compile: ASST2
+Only in src/kern/conf: ASST2-NORAND
+Only in src/kern/conf: ASST2-RAND
+Only in src/kern/conf: ASST3
+diff -aur ../a1-starter/src/kern/conf/conf.kern src/kern/conf/conf.kern
+--- ../a1-starter/src/kern/conf/conf.kern	2013-01-18 08:41:34.000000000 -0500
++++ src/kern/conf/conf.kern	2013-03-13 00:59:11.000000000 -0400
+@@ -325,14 +325,21 @@
+ file      thread/threadlist.c
+ #new file for process ID management in ASST2
+ file	  thread/pid.c
++
+ #
+ # Virtual memory system
+ # (you will probably want to add stuff here while doing the VM assignment)
+ #
+ 
++defoption randpage
++defoption randtlb
++
+ file      vm/kmalloc.c
+ 
+ optofffile dumbvm   vm/addrspace.c
++optofffile dumbvm   vm/lpage.c
++optofffile dumbvm   vm/swap.c
++optofffile dumbvm   vm/vmobj.c
+ 
+ #
+ # Network
+@@ -370,7 +377,10 @@
+ file      syscall/time_syscalls.c
+ # New file with setup for process-related syscalls
+ file	  syscall/proc_syscalls.c
+-file	  syscall/file_syscalls.c
++file      syscall/file_syscalls.c
++# BEGIN A3 SETUP
++file	  syscall/file.c
++# END A3 SETUP
+ 
+ #
+ # Startup and initialization
+@@ -389,6 +399,17 @@
+ # will be added here.
+ 
+ #
++# sfs (the small/simple filesystem)
++#
++
++# BEGIN A3 SETUP
++defoption sfs
++optfile   sfs    fs/sfs/sfs_fsops.c
++optfile   sfs    fs/sfs/sfs_io.c
++optfile   sfs    fs/sfs/sfs_vnops.c
++# END A3 SETUP
++
++#
+ # Note that "emufs" is completely contained in the "emu" device.
+ #
+ 
+@@ -416,6 +437,8 @@
+ file		test/synchtest.c
+ file		test/malloctest.c
+ file		test/fstest.c
++optofffile dumbvm test/coremaptest.c
++
+ # New test for ASST2
+ file		test/waittest.c 
+ optfile net	test/nettest.c
+Only in src/kern/fs: sfs
+diff -aur ../a1-starter/src/kern/include/addrspace.h src/kern/include/addrspace.h
+--- ../a1-starter/src/kern/include/addrspace.h	2013-01-18 08:41:27.000000000 -0500
++++ src/kern/include/addrspace.h	2013-03-13 00:59:03.000000000 -0400
+@@ -35,17 +35,22 @@
+  */
+ 
+ 
++#include <array.h>
+ #include <vm.h>
+ #include "opt-dumbvm.h"
+ 
+ struct vnode;
++struct vm_object; /* from vmprivate.h */
+ 
++DECLARRAY_BYTYPE(vm_object_array, struct vm_object);
+ 
+ /* 
+  * Address space - data structure associated with the virtual memory
+  * space of a process.
+  *
+- * You write this.
++ * In the solution set VM, the address space contains an array of
++ * vm_objects. Normally there will be one each for text, data/bss,
++ * stack, and heap. More can be added if needed.
+  */
+ 
+ struct addrspace {
+@@ -58,7 +63,8 @@
+         size_t as_npages2;
+         paddr_t as_stackpbase;
+ #else
+-        /* Put stuff here for your VM system */
++        /* Add additional address space objects here as necessary. */
++        struct vm_object_array *as_objects;
+ #endif
+ };
+ 
+@@ -103,6 +109,12 @@
+ 
+ int               as_define_region(struct addrspace *as, 
+                                    vaddr_t vaddr, size_t sz,
++/* BEGIN A3 SETUP */
++/* Needed to select dumbvm or real vm with config */
++#if !OPT_DUMBVM
++                                   size_t lower_redzone,
++#endif
++/* END A3 SETUP */
+                                    int readable, 
+                                    int writeable,
+                                    int executable);
+@@ -112,6 +124,12 @@
+ 
+ 
+ /*
++ * as_fault - handle fault in (the current) address space.
++ * as_sbrk - adjust the heap, like the sbrk() system call.
++ */
++int as_fault(struct addrspace *as, int faulttype, vaddr_t va);
++
++/*
+  * Functions in loadelf.c
+  *    load_elf - load an ELF user program executable into the current
+  *               address space. Returns the entry point (initial PC)
+diff -aur ../a1-starter/src/kern/include/cpu.h src/kern/include/cpu.h
+--- ../a1-starter/src/kern/include/cpu.h	2013-01-18 08:41:26.000000000 -0500
++++ src/kern/include/cpu.h	2013-03-13 00:59:02.000000000 -0400
+@@ -60,6 +60,7 @@
+ 	struct thread *c_curthread;	/* Current thread on cpu */
+ 	struct threadlist c_zombies;	/* List of exited threads */
+ 	unsigned c_hardclocks;		/* Counter of hardclock() calls */
++	struct cpu_vm_machdep c_vm;	/* Machine-dependent VM bits */
+ 
+ 	/*
+ 	 * Accessed by other cpus.
+@@ -165,7 +166,7 @@
+ 
+ void ipi_send(struct cpu *target, int code);
+ void ipi_broadcast(int code);
+-void ipi_tlbshootdown(struct cpu *target, const struct tlbshootdown *mapping);
++void ipi_tlbshootdown(unsigned targetcpu, const struct tlbshootdown *mapping);
+ 
+ void interprocessor_interrupt(void);
+ 
+Only in src/kern/include: file.h
+Only in src/kern/include/kern: sfs.h
+diff -aur ../a1-starter/src/kern/include/lib.h src/kern/include/lib.h
+--- ../a1-starter/src/kern/include/lib.h	2013-01-18 08:41:28.000000000 -0500
++++ src/kern/include/lib.h	2013-03-13 00:59:05.000000000 -0400
+@@ -88,6 +88,7 @@
+ #define DB_NET         0x200
+ #define DB_NETFS       0x400
+ #define DB_KMALLOC     0x800
++#define DB_TLB         0x1000
+ 
+ static const char *flag_name[] __attribute__((used)) = {
+             "DB_LOCORE",
+@@ -102,6 +103,7 @@
+             "DB_NET",
+             "DB_NETFS",
+             "DB_KMALLOC",
++            "DB_TLB",
+             //ADD NEW FLAG NAMES HERE
+             "/0"
+ };
+Only in src/kern/include: sfs.h
+diff -aur ../a1-starter/src/kern/include/syscall.h src/kern/include/syscall.h
+--- ../a1-starter/src/kern/include/syscall.h	2013-01-18 08:41:26.000000000 -0500
++++ src/kern/include/syscall.h	2013-03-13 00:59:02.000000000 -0400
+@@ -44,7 +44,7 @@
+  */
+ 
+ /* Helper for fork(). You write this. */
+-/* ASST1 - modified original signature to match the function that a 
++/* ASST2 - modified original signature to match the function that a 
+  * newly forked thread starts execution in. The first arg, data1, should
+  * be a pointer to a trapframe, copied from the parent.
+  */
+@@ -62,14 +62,29 @@
+ int sys_reboot(int code);
+ int sys___time(userptr_t user_seconds, userptr_t user_nanoseconds);
+ 
+-/* ASST1 setup */
++/* ASST2 setup */
+ int sys_fork(struct trapframe *tf, pid_t *retval);
+ int sys_read(int fd, userptr_t buf, size_t size, int *retval);
+ int sys_write(int fd, userptr_t buf, size_t size, int *retval);
+ 
+ /*
+- * ASST1 - Prototypes for new bootstrap/shutdown functions needed by syscalls
++ * ASST2 - Prototypes for new bootstrap/shutdown functions needed by syscalls
+  */
+ void dumb_consoleIO_bootstrap(void);
+ 
++/* BEGIN A3 SETUP */
++/* Note that sys_read and sys_write are prototyped above,
++ * as part of the A2 starter code.
++ */ 
++int sys_open(userptr_t filename, int flags, int mode, int *retval);
++int sys_close(int fd);
++int sys_dup2(int oldfd, int newfd, int *retval);
++int sys_lseek(int fd, off_t offset, int code, off_t *retval);
++int sys_chdir(userptr_t path);
++int sys___getcwd(userptr_t buf, size_t buflen, int *retval);
++int sys_getdirentry(int fd, userptr_t buf, size_t buflen, int *retval);
++int sys_fstat(int fd, userptr_t statptr);
++
++/* END A3 SETUP */
++
+ #endif /* _SYSCALL_H_ */
+diff -aur ../a1-starter/src/kern/include/test.h src/kern/include/test.h
+--- ../a1-starter/src/kern/include/test.h	2013-01-18 08:41:26.000000000 -0500
++++ src/kern/include/test.h	2013-03-13 02:10:55.000000000 -0400
+@@ -66,10 +66,13 @@
+ int writestress2(int, char **);
+ int longstress(int, char **);
+ int printfile(int, char **);
++int inlinetest(int, char **);
+ 
+ /* other tests */
+ int malloctest(int, char **);
+ int mallocstress(int, char **);
++int coremaptest(int, char **);
++int coremapstress(int, char **);
+ int nettest(int, char **);
+ 
+ /* Routine for running a user-level program. */
+diff -aur ../a1-starter/src/kern/include/thread.h src/kern/include/thread.h
+--- ../a1-starter/src/kern/include/thread.h	2013-01-18 08:41:27.000000000 -0500
++++ src/kern/include/thread.h	2013-03-13 00:59:04.000000000 -0400
+@@ -43,6 +43,10 @@
+ struct cpu;
+ struct vnode;
+ 
++/* BEGIN A3 SETUP */
++struct filetable;
++/* END A3 SETUP */
++
+ /* get machine-dependent defs */
+ #include <machine/thread.h>
+ 
+@@ -115,6 +119,9 @@
+ 	struct vnode *t_cwd;		/* current working directory */
+ 
+ 	/* add more here as needed */
++	/* BEGIN A3 SETUP */
++	struct filetable *t_filetable;
++	/* END A3 SETUP */
+ };
+ 
+ /* Call once during system startup to allocate data structures. */
+diff -aur ../a1-starter/src/kern/include/vm.h src/kern/include/vm.h
+--- ../a1-starter/src/kern/include/vm.h	2013-01-18 08:41:27.000000000 -0500
++++ src/kern/include/vm.h	2013-03-13 00:59:04.000000000 -0400
+@@ -32,22 +32,35 @@
+ 
+ /*
+  * VM system-related definitions.
+- *
+- * You'll probably want to add stuff here.
+  */
+ 
+-
+ #include <machine/vm.h>
+ 
++/* BEGIN A3 SETUP */
++/* This is needed to switch between dumbvm and real vm with config.
++ * It should have been part of A3 too.
++ */
++#include "opt-dumbvm.h"
++/* END A3 SETUP */
++
+ /* Fault-type arguments to vm_fault() */
+ #define VM_FAULT_READ        0    /* A read was attempted */
+ #define VM_FAULT_WRITE       1    /* A write was attempted */
+ #define VM_FAULT_READONLY    2    /* A write to a readonly page was attempted*/
+ 
+ 
+-/* Initialization function */
++/* Initialization function; returns size of physical memory. */
+ void vm_bootstrap(void);
+ 
++/* Initialization for swapfile */
++void swap_bootstrap(void);
++
++/* Shutdown function for swapfile; closes swap vnode. */
++void swap_shutdown(void);
++
++/* Print VM counters */
++void vm_printstats(void);
++
+ /* Fault handling function called by trap code */
+ int vm_fault(int faulttype, vaddr_t faultaddress);
+ 
+@@ -57,7 +70,19 @@
+ 
+ /* TLB shootdown handling called from interprocessor_interrupt */
+ void vm_tlbshootdown_all(void);
++
++/* BEGIN A3 SETUP */
++
++/* This is needed to switch between dumbvm and real vm with config.
++ * It should have been part of A3 too, but we just assumed no 
++ * dumbvm in that case. 
++ */
++#if OPT_DUMBVM
+ void vm_tlbshootdown(const struct tlbshootdown *);
++#else
++void vm_tlbshootdown(const struct tlbshootdown *, int num);
++#endif
+ 
++/* END A3 SETUP */
+ 
+ #endif /* _VM_H_ */
+Only in src/kern/include: vmprivate.h
+diff -aur ../a1-starter/src/kern/startup/main.c src/kern/startup/main.c
+--- ../a1-starter/src/kern/startup/main.c	2013-01-18 08:41:37.000000000 -0500
++++ src/kern/startup/main.c	2013-03-13 00:59:14.000000000 -0400
+@@ -48,7 +48,7 @@
+ #include <syscall.h>
+ #include <test.h>
+ #include <version.h>
+-#include <pid.h> /* to bootstrap process ID system - New for ASST1 */
++#include <pid.h> /* to bootstrap process ID system - New for ASST2 */
+ #include "autoconf.h"  // for pseudoconfig
+ 
+ 
+@@ -107,6 +107,7 @@
+ 
+ 	/* Early initialization. */
+ 	ram_bootstrap();
++        vm_bootstrap();
+ 	thread_bootstrap();
+ 	hardclock_bootstrap();
+ 	vfs_bootstrap();
+@@ -121,10 +122,16 @@
+ 	kprintf("\n");
+ 
+ 	/* Late phase of initialization. */
+-	vm_bootstrap();
++
++        /* BEGIN A3 SETUP */
++#if !OPT_DUMBVM
++	swap_bootstrap(); /* New for ASST3 - initialize swap system */
++#endif
++        /* END A3 SETUP */
++
+ 	kprintf_bootstrap();
+-	
+-	/* New for ASST1 - Initialize process ID managment. This should
++
++	/* New for ASST2 - Initialize process ID managment. This should
+ 	 * come before additional cpus are brought online.
+ 	 */
+ 	pid_bootstrap(); 
+diff -aur ../a1-starter/src/kern/startup/menu.c src/kern/startup/menu.c
+--- ../a1-starter/src/kern/startup/menu.c	2013-01-18 08:41:37.000000000 -0500
++++ src/kern/startup/menu.c	2013-03-13 00:59:14.000000000 -0400
+@@ -41,6 +41,26 @@
+ #include <syscall.h>
+ #include <test.h>
+ 
++/* BEGIN A3 SETUP */
++/* Needed to omit coremaptests when using dumbvm */
++#include "opt-dumbvm.h"
++/* Needed to include optional sfs code */
++#include "opt-sfs.h"
++
++#if OPT_SFS
++#include <sfs.h>
++#endif
++
++/* Hacky semaphore solution to make menu thread wait for command
++ * thread, in absence of thread_join solution.
++ */
++#include <synch.h>
++#include <current.h>
++struct semaphore *cmd_sem;
++int progthread_pid;
++
++/* END A3 SETUP */
++
+ /*
+  * In-kernel menu and command dispatcher.
+  */
+@@ -128,6 +148,13 @@
+ 	char progname2[128];
+ 	int result;
+ 
++	/* BEGIN A3 SETUP */
++	/* Record pid of progthread, so only this thread will do a V()
++	 * on the semaphore when it exits.
++	 */
++	progthread_pid = curthread->t_pid;
++	/* END A3 SETUP */
++
+ 	KASSERT(nargs >= 1);
+ 
+ 	if (nargs > 2) {
+@@ -198,6 +225,14 @@
+ 		return result;
+ 	}
+ 
++	/* BEGIN A3 SETUP */
++	/* This is not needed if you have a working pid_join -
++	 * that should be used instead.
++	 */
++	/* Wait for progthread to finish and send a V() */
++	P(cmd_sem);
++	/* END A3 SETUP */
++
+ 	return 0;
+ }
+ 
+@@ -398,6 +433,11 @@
+ 	const char *name;
+ 	int (*func)(const char *device);
+ } mounttable[] = {
++/* BEGIN A3 SETUP */
++#if OPT_SFS
++        { "sfs", sfs_mount },
++#endif
++/* END A3 SETUP */
+ 	{ NULL, NULL }
+ };
+ 
+@@ -563,6 +603,8 @@
+ 	"[sy1] Semaphore test                ",
+ 	"[sy2] Lock test             (1)     ",
+ 	"[sy3] CV test               (1)     ",
++	"[cm] Coremap test           (3)     ",
++	"[cm2] Coremap stress test   (3)     ",
+ 	"[fs1] Filesystem test               ",
+ 	"[fs2] FS read stress        (4)     ",
+ 	"[fs3] FS write stress       (4)     ",
+@@ -658,16 +700,26 @@
+ 	{ "sy2",	locktest },
+ 	{ "sy3",	cvtest },
+ 
+-	/* ASST1 tests */
++	/* ASST2 tests */
+ 	/* For testing the wait implementation. */
+ 	{ "wt",		waittest },
+ 
++/* BEGIN A3 SETUP */
++/* Only include coremap tests if not using dumbvm */	
++#if !OPT_DUMBVM
++	/* ASST2 tests */
++	{ "cm",		coremaptest },
++	{ "cm2",	coremapstress },
++#endif
++/* END A3 SETUP */
++
+ 	/* file system assignment tests */
+ 	{ "fs1",	fstest },
+ 	{ "fs2",	readstress },
+ 	{ "fs3",	writestress },
+ 	{ "fs4",	writestress2 },
+ 	{ "fs5",	longstress },
++        { "fs6",        inlinetest },
+ 
+ 	{ NULL, NULL }
+ };
+@@ -781,6 +833,16 @@
+ {
+ 	char buf[64];
+ 
++	/* BEGIN A3 SETUP */
++	/* Initialize hacky semaphore solution to make menu thread 
++	 * wait for command program to finish.
++	 */
++	cmd_sem = sem_create("cmdsem", 0);
++	if (cmd_sem == NULL) {
++		panic("menu: could not create cmd_sem\n");
++	}
++	/* END A3 SETUP */
++
+ 	menu_execute(args, 1);
+ 
+ 	while (1) {
+Only in src/kern/syscall: file.c
+diff -aur ../a1-starter/src/kern/syscall/file_syscalls.c src/kern/syscall/file_syscalls.c
+--- ../a1-starter/src/kern/syscall/file_syscalls.c	2013-01-18 08:41:32.000000000 -0500
++++ src/kern/syscall/file_syscalls.c	2013-03-13 00:59:09.000000000 -0400
+@@ -1,36 +1,48 @@
+-/*
+- * File-related system call implementations.
+- * New for ASST1
+- * Only crippled version of read/write for console I/O.
++/* BEGIN A3 SETUP */
++/* This file existed for A1 and A2, but has been completely replaced for A3.
++ * We have kept the dumb versions of sys_read and sys_write to support early
++ * testing, but they should be replaced with proper implementations that 
++ * use your open file table to find the correct vnode given a file descriptor
++ * number.  All the "dumb console I/O" code should be deleted.
+  */
+ 
+ #include <types.h>
+ #include <kern/errno.h>
+-#include <kern/unistd.h>
+ #include <lib.h>
+-#include <uio.h>
+ #include <thread.h>
+ #include <current.h>
++#include <syscall.h>
+ #include <vfs.h>
+ #include <vnode.h>
++#include <uio.h>
+ #include <kern/fcntl.h>
+-#include <syscall.h>
++#include <kern/unistd.h>
++#include <kern/limits.h>
++#include <kern/stat.h>
++#include <copyinout.h>
++#include <synch.h>
++#include <file.h>
+ 
+-/* dumb_consoleIO_bootstrap
+- * Initialize a vnode for the console device so that
+- * user programs can use it.
++/* This special-case global variable for the console vnode should be deleted 
++ * when you have a proper open file table implementation.
+  */
+-struct vnode *cons_vnode;
++struct vnode *cons_vnode=NULL; 
+ 
+-void dumb_consoleIO_bootstrap() 
++/* This function should be deleted, including the call in main.c, when you
++ * have proper initialization of the first 3 file descriptors in your 
++ * open file table implementation.
++ * You may find it useful as an example of how to get a vnode for the 
++ * console device.
++ */
++void dumb_consoleIO_bootstrap()
+ {
+   int result;
+   char path[5];
+ 
+-  /* The path passed to vfs_open must be mutable. 
++  /* The path passed to vfs_open must be mutable.
+    * vfs_open may modify it.
+    */
+-  
++
+   strcpy(path, "con:");
+   result = vfs_open(path, O_RDWR, 0, &cons_vnode);
+ 
+@@ -51,15 +63,14 @@
+  */
+ static
+ void
+-mk_useruio(struct iovec *iov, struct uio *u, 
+-	   userptr_t buf, size_t len, off_t offset, enum uio_rw rw)
++mk_useruio(struct iovec *iov, struct uio *u, userptr_t buf, 
++	   size_t len, off_t offset, enum uio_rw rw)
+ {
+-	KASSERT(u);
+-	KASSERT(iov);
++
+ 	iov->iov_ubase = buf;
+ 	iov->iov_len = len;
+ 	u->uio_iov = iov;
+-        u->uio_iovcnt = 1;
++	u->uio_iovcnt = 1;
+ 	u->uio_offset = offset;
+ 	u->uio_resid = len;
+ 	u->uio_segflg = UIO_USERSPACE;
+@@ -68,8 +79,73 @@
+ }
+ 
+ /*
++ * sys_open
++ * just copies in the filename, then passes work to file_open.
++ * You have to write file_open.
++ * 
++ */
++int
++sys_open(userptr_t filename, int flags, int mode, int *retval)
++{
++	char *fname;
++	int result;
++
++	if ( (fname = (char *)kmalloc(__PATH_MAX)) == NULL) {
++		return ENOMEM;
++	}
++
++	result = copyinstr(filename, fname, __PATH_MAX, NULL);
++	if (result) {
++		kfree(fname);
++		return result;
++	}
++
++	result =  file_open(fname, flags, mode, retval);
++	kfree(fname);
++	return result;
++}
++
++/* 
++ * sys_close
++ * You have to write file_close.
++ */
++int
++sys_close(int fd)
++{
++	return file_close(fd);
++}
++
++/* 
++ * sys_dup2
++ * 
++ */
++int
++sys_dup2(int oldfd, int newfd, int *retval)
++{
++        (void)oldfd;
++        (void)newfd;
++        (void)retval;
++
++	return EUNIMP;
++}
++
++/*
+  * sys_read
+  * calls VOP_READ.
++ * 
++ * A3: This is the "dumb" implementation of sys_write:
++ * it only deals with file descriptors 1 and 2, and 
++ * assumes they are permanently associated with the 
++ * console vnode (which must have been previously initialized).
++ *
++ * In your implementation, you should use the file descriptor
++ * to find a vnode from your file table, and then read from it.
++ *
++ * Note that any problems with the address supplied by the
++ * user as "buf" will be handled by the VOP_READ / uio code
++ * so you do not have to try to verify "buf" yourself.
++ *
++ * Most of this code should be replaced.
+  */
+ int
+ sys_read(int fd, userptr_t buf, size_t size, int *retval)
+@@ -113,42 +189,132 @@
+ /*
+  * sys_write
+  * calls VOP_WRITE.
++ *
++ * A3: This is the "dumb" implementation of sys_write:
++ * it only deals with file descriptors 1 and 2, and 
++ * assumes they are permanently associated with the 
++ * console vnode (which must have been previously initialized).
++ *
++ * In your implementation, you should use the file descriptor
++ * to find a vnode from your file table, and then read from it.
++ *
++ * Note that any problems with the address supplied by the
++ * user as "buf" will be handled by the VOP_READ / uio code
++ * so you do not have to try to verify "buf" yourself.
++ *
++ * Most of this code should be replaced.
+  */
++
+ int
+-sys_write(int fd, userptr_t buf, size_t size, int *retval)
++sys_write(int fd, userptr_t buf, size_t len, int *retval) 
+ {
+-	struct uio user_uio;
+-	struct iovec user_iov;
+-	int result;
+-	int offset = 0;
++        struct uio user_uio;
++        struct iovec user_iov;
++        int result;
++        int offset = 0;
++
++        /* Make sure we were able to init the cons_vnode */
++        if (cons_vnode == NULL) {
++          return ENODEV;
++        }
++
++        /* Right now, only stdin (0), stdout (1) and stderr (2)
++         * are supported, and they can't be redirected to a file
++         */
++        if (fd < 0 || fd > 2) {
++          return EBADF;
++        }
++
++        /* set up a uio with the buffer, its size, and the current offset */
++        mk_useruio(&user_iov, &user_uio, buf, len, offset, UIO_WRITE);
++
++        /* does the write */
++        result = VOP_WRITE(cons_vnode, &user_uio);
++        if (result) {
++                return result;
++        }
++
++        /*
++         * the amount written is the size of the buffer originally,
++         * minus how much is left in it.
++         */
++        *retval = len - user_uio.uio_resid;
+ 
+-	/* Make sure we were able to init the cons_vnode */
+-	if (cons_vnode == NULL) {
+-	  return ENODEV;
+-	}
++        return 0;
++}
+ 
+-	/* Right now, only stdin (0), stdout (1) and stderr (2)
+-	 * are supported, and they can't be redirected to a file
+-	 */
+-	if (fd < 0 || fd > 2) {
+-	  return EBADF;
+-	}
++/*
++ * sys_lseek
++ * 
++ */
++int
++sys_lseek(int fd, off_t offset, int whence, off_t *retval)
++{
++        (void)fd;
++        (void)offset;
++        (void)whence;
++        (void)retval;
+ 
+-	/* set up a uio with the buffer, its size, and the current offset */
+-	mk_useruio(&user_iov, &user_uio, buf, size, offset, UIO_WRITE);
++	return EUNIMP;
++}
+ 
+-	/* does the write */
+-	result = VOP_WRITE(cons_vnode, &user_uio);
+-	if (result) {
+-		return result;
+-	}
+ 
+-	/*
+-	 * the amount written is the size of the buffer originally,
+-	 * minus how much is left in it.
+-	 */
+-	*retval = size - user_uio.uio_resid;
++/* really not "file" calls, per se, but might as well put it here */
+ 
+-	return 0;
++/*
++ * sys_chdir
++ * 
++ */
++int
++sys_chdir(userptr_t path)
++{
++        (void)path;
++
++	return EUNIMP;
+ }
+ 
++/*
++ * sys___getcwd
++ * 
++ */
++int
++sys___getcwd(userptr_t buf, size_t buflen, int *retval)
++{
++        (void)buf;
++        (void)buflen;
++        (void)retval;
++
++	return EUNIMP;
++}
++
++/*
++ * sys_fstat
++ */
++int
++sys_fstat(int fd, userptr_t statptr)
++{
++        (void)fd;
++        (void)statptr;
++
++	return EUNIMP;
++}
++
++/*
++ * sys_getdirentry
++ */
++int
++sys_getdirentry(int fd, userptr_t buf, size_t buflen, int *retval)
++{
++        (void)fd;
++        (void)buf;
++	(void)buflen;
++        (void)retval;
++
++	return EUNIMP;
++}
++
++/* END A3 SETUP */
++
++
++
++
+diff -aur ../a1-starter/src/kern/syscall/loadelf.c src/kern/syscall/loadelf.c
+--- ../a1-starter/src/kern/syscall/loadelf.c	2013-01-18 08:41:32.000000000 -0500
++++ src/kern/syscall/loadelf.c	2013-03-13 00:59:09.000000000 -0400
+@@ -60,6 +60,10 @@
+ #include <vnode.h>
+ #include <elf.h>
+ 
++/* BEGIN A3 SETUP */
++#include "opt-dumbvm.h"
++/* END A3 SETUP */
++
+ /*
+  * Load a segment at virtual address VADDR. The segment in memory
+  * extends from VADDR up to (but not including) VADDR+MEMSIZE. The
+@@ -239,11 +243,26 @@
+ 			return ENOEXEC;
+ 		}
+ 
+-		result = as_define_region(curthread->t_addrspace,
+-					  ph.p_vaddr, ph.p_memsz,
+-					  ph.p_flags & PF_R,
+-					  ph.p_flags & PF_W,
+-					  ph.p_flags & PF_X);
++                /* BEGIN A3 SETUP */
++                /* This is needed to switch between dumbvm and real vm.
++                 * It should have been included with A3 code as well.
++                 */
++#if OPT_DUMBVM
++                result = as_define_region(curthread->t_addrspace,
++                                          ph.p_vaddr, ph.p_memsz,
++                                          ph.p_flags & PF_R,
++                                          ph.p_flags & PF_W,
++                                          ph.p_flags & PF_X);
++#else
++                result = as_define_region(curthread->t_addrspace,
++                                          ph.p_vaddr, ph.p_memsz,
++                                          0,
++                                          ph.p_flags & PF_R,
++                                          ph.p_flags & PF_W,
++                                          ph.p_flags & PF_X);
++#endif
++                /* END A3 SETUP */
++
+ 		if (result) {
+ 			return result;
+ 		}
+diff -aur ../a1-starter/src/kern/syscall/proc_syscalls.c src/kern/syscall/proc_syscalls.c
+--- ../a1-starter/src/kern/syscall/proc_syscalls.c	2013-01-18 08:41:32.000000000 -0500
++++ src/kern/syscall/proc_syscalls.c	2013-03-13 00:59:09.000000000 -0400
+@@ -1,6 +1,6 @@
+ /*
+  * Process-related syscalls.
+- * New for ASST1.
++ * New for A2.
+  */
+ 
+ #include <types.h>
+Only in src/kern/test: coremaptest.c
+diff -aur ../a1-starter/src/kern/test/fstest.c src/kern/test/fstest.c
+--- ../a1-starter/src/kern/test/fstest.c	2013-01-18 08:41:33.000000000 -0500
++++ src/kern/test/fstest.c	2013-03-13 02:19:13.000000000 -0400
+@@ -49,6 +49,7 @@
+ #include <fs.h>
+ #include <vnode.h>
+ #include <test.h>
++#include <kern/sfs.h>
+ 
+ #define SLOGAN   "HODIE MIHI - CRAS TIBI\n"
+ #define FILENAME "fstest.tmp"
+@@ -535,6 +536,190 @@
+ 
+ ////////////////////////////////////////////////////////////
+ 
++static void 
++fillbuf(char *buf, int buflen, unsigned char c) {
++	int i;
++	for (i=0; i < buflen; i++) {
++		buf[i] = c;
++	}
++}
++
++static int
++checkbuf(char *buf, int buflen, unsigned char c) {
++	int i;
++	for (i=0; i < buflen; i++) {
++		if (buf[i] != c) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++static int
++doinlinecreate(struct vnode *vn, char *name, char *buf)
++{
++	int i,j;
++	int err;
++	int blocknum;
++	off_t pos=0;
++	size_t bytes=0;
++	struct uio ku;
++	struct iovec iov;
++	unsigned char curchar=1;
++	const int sfs_max_file_size= (SFS_NDIRECT+SFS_DBPERIDB)*SFS_BLOCKSIZE 
++		                    + SFS_INLINED_BYTES;
++
++	blocknum=1;
++	while (i < sfs_max_file_size) {
++		fillbuf(buf, 32, curchar);
++		kprintf("Doing block %d\n",blocknum);
++		for (j=0; j < 16; j++) {
++			uio_kinit(&iov, &ku, buf, 32, pos, UIO_WRITE);
++			err = VOP_WRITE(vn, &ku);
++			if (err) {
++				kprintf("%s: Write error: %s\n", name, strerror(err));
++				return EIO;
++			}
++
++			if (ku.uio_resid > 0) {
++				kprintf("%s: Short write: %lu bytes left over\n",
++					name, (unsigned long) ku.uio_resid);
++				return EIO;
++			}
++			bytes += (ku.uio_offset - pos);
++			pos = ku.uio_offset;
++			i = pos;
++			if (i == sfs_max_file_size) {
++				break;
++			}
++		}
++		curchar++;
++		blocknum++;
++	}
++
++	if ((unsigned long)bytes == (unsigned long)sfs_max_file_size) {
++		kprintf("PASSED %s: %lu bytes written\n", name, (unsigned long)bytes); 
++	} else {
++		kprintf("FAILED %s: only %lu bytes written, should be %lu\n",name,(unsigned long)bytes, (unsigned long)sfs_max_file_size);
++	}
++
++	return 0;
++}
++
++static int
++doinlineread(struct vnode *vn, char *name, char *buf)
++{
++	int i,j;
++	int err;
++	int blocknum;
++	off_t pos=0;
++	size_t bytes=0;
++	struct uio ku;
++	struct iovec iov;
++	unsigned char curchar=1;
++	const int sfs_max_file_size= (SFS_NDIRECT+SFS_DBPERIDB)*SFS_BLOCKSIZE 
++		                    + SFS_INLINED_BYTES;
++
++	blocknum=1;
++	while (i < sfs_max_file_size) {
++		for (j=0; j < 16; j++) {
++			uio_kinit(&iov, &ku, buf, 32, pos, UIO_READ);
++			err = VOP_READ(vn, &ku);
++			if (err) {
++				kprintf("%s: Read error: %s\n", name, strerror(err));
++				return EIO;
++			}
++
++			if (ku.uio_resid > 0) {
++				kprintf("%s: Short read: %lu bytes left over\n",
++					name, (unsigned long) ku.uio_resid);
++				return EIO;
++			}
++
++			if (checkbuf(buf, 32, curchar)) {
++				kprintf("%s: bytes read contained unexpected values\n", name);
++				return EIO;
++			}
++
++			bytes += (ku.uio_offset - pos);
++			pos = ku.uio_offset;
++			i = pos;
++			if (i == sfs_max_file_size) {
++				break;
++			}
++		}
++		curchar++;
++		blocknum++;
++	}
++
++	if ((unsigned long)bytes == (unsigned long)sfs_max_file_size) {
++		kprintf("PASSED %s: %lu bytes read\n", name, (unsigned long)bytes); 
++	} else {
++		kprintf("FAILED %s: only %lu bytes read, should be %lu\n",name,(unsigned long)bytes, (unsigned long)sfs_max_file_size);
++	}
++
++	return 0;
++}
++
++static
++void
++doinlinetest(const char *filesys)
++{
++	int err;
++	char name[32];
++	char buf[32];
++	int flags;
++	const char *fs=filesys;
++	const char *namesuffix="";
++	struct vnode *vn;
++
++	kprintf("*** Starting filesystem inline data test on %s:\n", filesys);
++	kprintf("*** This is only expected to work on an SFS file system with the A3 inlining optimization\n");
++
++	MAKENAME();
++
++	/* Create large file - will only succeed if extra space in SFS
++	 * inode is available to store file data.
++	 */
++	flags = O_WRONLY|O_CREAT|O_TRUNC;
++	/* vfs_open destroys the string it's passed */
++	strcpy(buf, name);
++	err = vfs_open(buf, flags, 0664, &vn);
++	if (err) {
++		kprintf("Could not open %s for write: %s\n", 
++			name, strerror(err));
++		return;
++	}
++	err = doinlinecreate(vn, name, buf);
++	vfs_close(vn);
++
++	if (err) {
++		vfs_remove(name);
++		return;
++	}
++
++	/* Now try to open and read the file back. */
++	flags = O_RDONLY;
++	/* vfs_open destroys the string it's passed */
++	strcpy(buf, name);
++	err = vfs_open(buf, flags, 0664, &vn);
++	if (err) {
++		kprintf("Could not open %s for read: %s\n", 
++			name, strerror(err));
++		return;
++	}
++	err = doinlineread(vn, name, buf);
++	vfs_close(vn);
++
++	/* It would be sensible to add some tests of VOP_TRUNCATE here ... */
++
++	vfs_remove(name);	
++	return;
++
++}
++
++////////////////////////////////////////////////////////////
++
+ static
+ int
+ checkfilesystem(int nargs, char **args)
+@@ -542,7 +727,7 @@
+ 	char *device;
+ 
+ 	if (nargs != 2) {
+-		kprintf("Usage: fs[12345] filesystem:\n");
++		kprintf("Usage: fs[123456] filesystem:\n");
+ 		return EINVAL;
+ 	}
+ 
+@@ -574,6 +759,7 @@
+ DEFTEST(writestress);
+ DEFTEST(writestress2);
+ DEFTEST(longstress);
++DEFTEST(inlinetest);
+ 
+ ////////////////////////////////////////////////////////////
+ 
+diff -aur ../a1-starter/src/kern/thread/thread.c src/kern/thread/thread.c
+--- ../a1-starter/src/kern/thread/thread.c	2013-01-18 08:41:39.000000000 -0500
++++ src/kern/thread/thread.c	2013-03-13 00:59:15.000000000 -0400
+@@ -48,8 +48,19 @@
+ #include <mainbus.h>
+ #include <vnode.h>
+ #include <kern/sysexits.h>
+-#include <kern/wait.h> /* New include of macros to make exit codes for ASST1 */
+-#include <pid.h> /* New include of pid functions for ASST 1 */
++#include <kern/wait.h> /* New include of macros to make exit codes for ASST2 */
++#include <pid.h> /* New include of pid functions for ASST 2 */
++
++/* BEGIN A3 SETUP */
++#include <file.h>
++#include "opt-dumbvm.h" /* to switch between dumb and real vm */
++
++/* External variables for hack to make menu thread wait for progthread */
++extern struct semaphore *cmd_sem;
++extern int progthread_pid;
++
++/* END A3 SETUP */
++
+ #include "opt-synchprobs.h"
+ 
+ 
+@@ -158,6 +169,10 @@
+ 
+ 	/* If you add to struct thread, be sure to initialize here */
+ 
++	/* BEGIN A3 SETUP */
++	thread->t_filetable = NULL;
++	/* END A3 SETUP */
++
+ 	return thread;
+ }
+ 
+@@ -188,6 +203,12 @@
+ 	threadlist_init(&c->c_zombies);
+ 	c->c_hardclocks = 0;
+ 
++        /* BEGIN A3 SETUP */
++#if !OPT_DUMBVM
++	cpu_vm_machdep_init(&c->c_vm); /* NEW FOR A3 */
++#endif
++        /* END A3 SETUP */
++
+ 	c->c_isidle = false;
+ 	threadlist_init(&c->c_runqueue);
+ 	spinlock_init(&c->c_runqueue_lock);
+@@ -216,7 +237,7 @@
+ 		 */
+ 		/*c->c_curthread->t_stack = ... */
+ 
+-		/* Also, set the initial process ID - New for ASST1. */
++		/* Also, set the initial process ID - New for ASST2. */
+ 		c->c_curthread->t_pid = BOOTUP_PID;
+ 	}
+ 	else {
+@@ -226,7 +247,7 @@
+ 		}
+ 		thread_checkstack_init(c->c_curthread);
+ 
+-		/* Assign a process ID for the new CPU - New for ASST1. */
++		/* Assign a process ID for the new CPU - New for ASST2. */
+ 		result = pid_alloc(&c->c_curthread->t_pid);
+ 		if (result) {
+ 			panic("cpu_create: pid_alloc failed\n");
+@@ -490,7 +511,7 @@
+  * start on the same CPU as the caller, unless the scheduler
+  * intervenes first.
+  *
+- * ASST1 - thread_fork has been modified to return the pid of the new 
++ * ASST2 - thread_fork has been modified to return the pid of the new 
+  * thread, rather than a pointer to its thread struct. For simplicity,
+  * we are giving the new thread a copy of its parent's address space, if
+  * it has one, contrary to the comment above.
+@@ -517,14 +538,14 @@
+ 	}
+ 	thread_checkstack_init(newthread);
+ 
+-	/* Get a process ID - new for ASST1 */
++	/* Get a process ID - new for ASST2 */
+ 	result = pid_alloc(&newthread->t_pid);
+ 	if (result) {
+ 		thread_destroy(newthread);
+ 		return result;
+ 	}
+ 
+-	/* Copy address space if there is one - new for ASST1, sys_fork */
++	/* Copy address space if there is one - new for ASST2, sys_fork */
+ 	if (curthread->t_addrspace != NULL) {
+ 		result = as_copy(curthread->t_addrspace, &newthread->t_addrspace);
+ 		if (result) {
+@@ -541,9 +562,6 @@
+ 	/* Thread subsystem fields */
+ 	newthread->t_cpu = curthread->t_cpu;
+ 
+-	/* VM fields */
+-	/* do not clone address space -- let caller decide on that */
+-
+ 	/* VFS fields */
+ 	if (curthread->t_cwd != NULL) {
+ 		VOP_INCREF(curthread->t_cwd);
+@@ -569,7 +587,7 @@
+ 	 * the thread structure from the parent thread should be done
+ 	 * only with caution, because in general the child thread
+ 	 * might exit at any time.
+-	 * ASST1 - changed to return child's process ID instead of 
++	 * ASST2 - changed to return child's process ID instead of 
+ 	 *         thread structure.  This is safe to use even if the 
+ 	 *         child has already exited.
+ 	 */
+@@ -835,6 +853,17 @@
+ 
+ 	cur = curthread;
+ 
++	/* BEGIN A3 SETUP */
++	/* Check if this thread was forked to handle a menu command,
++	 * and if so, signal the menu thread that it is done.
++	 * This should not be used if you have a working thread_join
++	 * implementation.
++	 */
++	if (curthread->t_pid == progthread_pid) {
++		V(cmd_sem);
++	}
++	/* END A3 SETUP */
++
+ 	/* VFS fields */
+ 	if (cur->t_cwd) {
+ 		VOP_DECREF(cur->t_cwd);
+@@ -1197,32 +1226,34 @@
+ }
+ 
+ void
+-ipi_tlbshootdown(struct cpu *target, const struct tlbshootdown *mapping)
++ipi_tlbshootdown(unsigned targetcpu, const struct tlbshootdown *mapping)
+ {
+-	int n;
++        int n;
++        struct cpu *target;
+ 
+-	spinlock_acquire(&target->c_ipi_lock);
++        target = cpuarray_get(&allcpus, targetcpu);
+ 
+-	n = target->c_numshootdown;
+-	if (n == TLBSHOOTDOWN_MAX) {
+-		target->c_numshootdown = TLBSHOOTDOWN_ALL;
+-	}
+-	else {
+-		target->c_shootdown[n] = *mapping;
+-		target->c_numshootdown = n+1;
+-	}
++        spinlock_acquire(&target->c_ipi_lock);
+ 
+-	target->c_ipi_pending |= (uint32_t)1 << IPI_TLBSHOOTDOWN;
+-	mainbus_send_ipi(target);
++        n = target->c_numshootdown;
++        if (n == TLBSHOOTDOWN_MAX) {
++                target->c_numshootdown = TLBSHOOTDOWN_ALL;
++        }
++        else {
++                target->c_shootdown[n] = *mapping;
++                target->c_numshootdown = n+1;
++        }
+ 
+-	spinlock_release(&target->c_ipi_lock);
++        target->c_ipi_pending |= (uint32_t)1 << IPI_TLBSHOOTDOWN;
++        mainbus_send_ipi(target);
++
++        spinlock_release(&target->c_ipi_lock);
+ }
+ 
+ void
+ interprocessor_interrupt(void)
+ {
+ 	uint32_t bits;
+-	int i;
+ 
+ 	spinlock_acquire(&curcpu->c_ipi_lock);
+ 	bits = curcpu->c_ipi_pending;
+@@ -1255,9 +1286,15 @@
+ 			vm_tlbshootdown_all();
+ 		}
+ 		else {
+-			for (i=0; i<curcpu->c_numshootdown; i++) {
+-				vm_tlbshootdown(&curcpu->c_shootdown[i]);
+-			}
++                        /* BEGIN A3 SETUP */
++                        /* To switch between dumbvm and real vm. */
++#if OPT_DUMBVM
++                        vm_tlbshootdown(curcpu->c_shootdown);
++#else
++                        vm_tlbshootdown(curcpu->c_shootdown,
++                                        curcpu->c_numshootdown);
++#endif
++                        /* END A3 SETUP */
+ 		}
+ 		curcpu->c_numshootdown = 0;
+ 	}
+diff -aur ../a1-starter/src/kern/vm/addrspace.c src/kern/vm/addrspace.c
+--- ../a1-starter/src/kern/vm/addrspace.c	2013-01-18 08:41:37.000000000 -0500
++++ src/kern/vm/addrspace.c	2013-03-13 00:59:14.000000000 -0400
+@@ -29,9 +29,21 @@
+ 
+ #include <types.h>
+ #include <kern/errno.h>
++#include <kern/unistd.h>
++#include <limits.h>
+ #include <lib.h>
++#include <array.h>
++#include <uio.h>
++#include <thread.h>
++#include <current.h>
+ #include <addrspace.h>
+ #include <vm.h>
++#include <vmprivate.h>
++#include <machine/coremap.h>   /* for mmu_setas() */
++#include <vnode.h>
++#include <vfs.h>
++#include <syscall.h>
++
+ 
+ /*
+  * Note! If OPT_DUMBVM is set, as is the case until you start the VM
+@@ -39,6 +51,14 @@
+  * used. The cheesy hack versions in dumbvm.c are used instead.
+  */
+ 
++
++
++DEFARRAY_BYTYPE(vm_object_array, struct vm_object, /*noinline*/);
++
++/*
++ * as_create - create an address space structure.
++ * Synchronization: none.
++ */
+ struct addrspace *
+ as_create(void)
+ {
+@@ -49,17 +69,29 @@
+ 		return NULL;
+ 	}
+ 
+-	/*
+-	 * Initialize as needed.
+-	 */
++	as->as_objects = vm_object_array_create();
++	if (as->as_objects == NULL) {
++		kfree(as);
++		return NULL;
++	}
+ 
+ 	return as;
+ }
+ 
++/*
++ * as_copy: duplicate an address space. Creates a new address space and
++ * copies each vm_object in the source address space into the new one.
++ * Implements the VM system part of fork().
++ *
++ * Synchronization: none.
++ */
+ int
+-as_copy(struct addrspace *old, struct addrspace **ret)
++as_copy(struct addrspace *as, struct addrspace **ret)
+ {
+ 	struct addrspace *newas;
++	struct vm_object *vmo, *newvmo;
++	unsigned i;
++	int result;
+ 
+ 	newas = as_create();
+ 	if (newas==NULL) {
+@@ -67,33 +99,124 @@
+ 	}
+ 
+ 	/*
+-	 * Write this.
++	 * We assume that as belongs to curthread, and furthermore that
++	 * it's not shared with any other threads. (The latter restriction
++	 * is easily lifted; the former is not.)
++	 *
++	 * We assume that nothing is going to modify the source address
++	 * space except for the usual page evictions by other processes.
+ 	 */
+ 
+-	(void)old;
++	KASSERT(as == curthread->t_addrspace);
++
++
++	/* copy the vmos */
++	for (i = 0; i < vm_object_array_num(as->as_objects); i++) {
++		vmo = vm_object_array_get(as->as_objects, i);
++
++		result = vm_object_copy(vmo, newas, &newvmo);
++		if (result) {
++			goto fail;
++		}
++
++		result = vm_object_array_add(newas->as_objects, newvmo, NULL);
++		if (result) {
++			vm_object_destroy(newas, newvmo);
++			goto fail;
++		}
++	}
+ 	
+ 	*ret = newas;
+ 	return 0;
++
++fail:
++	as_destroy(newas);
++	return result;
+ }
+ 
++/*
++ * as_fault: fault handling. Handle a fault on an address space, of
++ * specified type, at specified address.
++ *
++ * Synchronization: none. We assume the address space is not shared,
++ * so we don't lock it.
++ */
++int
++as_fault(struct addrspace *as, int faulttype, vaddr_t va)
++{
++	struct vm_object *faultobj = NULL;
++	struct lpage *lp;
++	vaddr_t bot=0, top;
++	unsigned i, index;
++	int result;
++
++	/* Find the vm_object concerned */
++	for (i=0; i<vm_object_array_num(as->as_objects); i++) {
++		struct vm_object *vmo;
++
++		vmo = vm_object_array_get(as->as_objects, i);
++		bot = vmo->vmo_base;
++		top = bot + PAGE_SIZE * lpage_array_num(vmo->vmo_lpages);
++		if (va >= bot && va < top) {
++			faultobj = vmo;
++			break;
++		}
++	}
++
++	if (faultobj == NULL) {
++		DEBUG(DB_VM, "vm_fault: EFAULT: va=0x%x\n", va);
++		return EFAULT;
++	}
++
++	/* Now get the logical page */
++	index = (va - bot) / PAGE_SIZE;
++	lp = lpage_array_get(faultobj->vmo_lpages, index);
++
++	if (lp == NULL) {
++		/* zerofill page */
++		result = lpage_zerofill(&lp);
++		if (result) {
++			kprintf("vm: zerofill fault at 0x%x failed\n", va);
++			return result;
++		}
++		lpage_array_set(faultobj->vmo_lpages, index, lp);
++	}
++	
++	return lpage_fault(lp, as, faulttype, va);
++}
++
++/*
++ * as_destroy: wipe out an address space by destroying its components.
++ * Synchronization: none.
++ */
+ void
+ as_destroy(struct addrspace *as)
+ {
+-	/*
+-	 * Clean up as needed.
+-	 */
+-	
++	struct vm_object *vmo;
++	unsigned i;
++
++	for (i = 0; i < vm_object_array_num(as->as_objects); i++) {
++		vmo = vm_object_array_get(as->as_objects, i);
++		vm_object_destroy(as, vmo);
++	}
++
++	vm_object_array_setsize(as->as_objects, 0);
++	vm_object_array_destroy(as->as_objects);
+ 	kfree(as);
+ }
+ 
++/*
++ * as_activate: load specified address space into the MMU as the
++ * current address space. Called from context switch and also during
++ * execv().
++ *
++ * Synchronization: none.
++ */
+ void
+ as_activate(struct addrspace *as)
+ {
+-	/*
+-	 * Write this.
+-	 */
+-
+-	(void)as;  // suppress warning until code gets written
++	KASSERT(as==NULL || as==curthread->t_addrspace);
++	mmu_setas(as);
+ }
+ 
+ /*
+@@ -103,60 +226,131 @@
+  *
+  * The READABLE, WRITEABLE, and EXECUTABLE flags are set if read,
+  * write, or execute permission should be set on the segment. At the
+- * moment, these are ignored. When you write the VM system, you may
+- * want to implement them.
++ * moment, these are ignored.
++ *
++ * Does not allow overlapping regions.
+  */
+ int
+ as_define_region(struct addrspace *as, vaddr_t vaddr, size_t sz,
++		 size_t lower_redzone,
+ 		 int readable, int writeable, int executable)
+ {
+-	/*
+-	 * Write this.
+-	 */
++	struct vm_object *vmo;
++	unsigned i;
++	int result;
++	vaddr_t check_vaddr;	/* vaddr to use for overlap check */
+ 
+-	(void)as;
+-	(void)vaddr;
+-	(void)sz;
+ 	(void)readable;
+-	(void)writeable;
++	(void)writeable;	// XXX
+ 	(void)executable;
+-	return EUNIMP;
++
++	/* align base address */
++	vaddr &= PAGE_FRAME;
++
++	/* redzone must be aligned */
++	KASSERT((lower_redzone & PAGE_FRAME) == lower_redzone);
++
++	/* redzone must fit */
++	KASSERT(vaddr >= lower_redzone);
++	check_vaddr = vaddr - lower_redzone;
++
++	/* size may not be */
++	sz = ROUNDUP(sz, PAGE_SIZE);
++
++	/*
++	 * Check for overlaps.
++	 */
++	for (i = 0; i < vm_object_array_num(as->as_objects); i++) {
++		vaddr_t bot, top;
++		
++		vmo = vm_object_array_get(as->as_objects, i);
++		KASSERT(vmo != NULL);
++		bot = vmo->vmo_base;
++		top = bot + PAGE_SIZE * lpage_array_num(vmo->vmo_lpages);
++
++		/* Check guard band, if any */
++		KASSERT(bot >= vmo->vmo_lower_redzone);
++		bot = bot - vmo->vmo_lower_redzone;
++
++		if (check_vaddr+sz > bot && check_vaddr < top) {
++			/* overlap */
++			return EINVAL;
++		}
++	}
++
++
++	/* Create a new vmo. All pages are marked zerofilled. */
++	vmo = vm_object_create(sz/PAGE_SIZE);
++	if (vmo == NULL) {
++		return ENOMEM;
++	}
++	vmo->vmo_base = vaddr;
++	vmo->vmo_lower_redzone = lower_redzone;
++
++	/* Add it to the parent address space. */
++	result = vm_object_array_add(as->as_objects, vmo, NULL);
++	if (result) {
++		vm_object_destroy(as, vmo);
++		return result;
++	}
++
++	/* Done */
++	return 0;
+ }
+ 
++/*
++ * as_prepare_load: called before loading executable segments.
++ */
+ int
+ as_prepare_load(struct addrspace *as)
+ {
+ 	/*
+-	 * Write this.
++	 * Do nothing.
+ 	 */
+ 
+ 	(void)as;
+ 	return 0;
+ }
+ 
++/*
++ * as_complete_load: called after loading executable segments.
++ */
+ int
+ as_complete_load(struct addrspace *as)
+ {
+ 	/*
+-	 * Write this.
++	 * Do nothing.
+ 	 */
+ 
+ 	(void)as;
+ 	return 0;
+ }
+ 
++/*
++ * as_define_stack - define the vm_object for the user-level stack.
++ */
+ int
+ as_define_stack(struct addrspace *as, vaddr_t *stackptr)
+ {
++	int err;
++
+ 	/*
+-	 * Write this.
++	 * make a stack vm_object 
++	 *
++	 * The stack is USERSTACKSIZE bytes, which is defined in machine/vm.h.
++	 * This is generally quite large, so it is zerofilled to make swap use
++	 * efficient and fork reasonably fast.
+ 	 */
+ 
+-	(void)as;
++	err = as_define_region(as, USERSTACKBASE, USERSTACKSIZE, 
++			       USERSTACKREDZONE,
++			       1, 1, 0);
++	if (err) {
++		return err;
++	}
+ 
+ 	/* Initial user-level stack pointer */
+ 	*stackptr = USERSTACK;
+ 	
+ 	return 0;
+ }
+-
+Only in src/kern/vm: lpage.c
+Only in src/kern/vm: swap.c
+Only in src/kern/vm: vmobj.c
+diff -aur ../a1-starter/src/sys161.conf src/sys161.conf
+--- ../a1-starter/src/sys161.conf	2013-01-18 08:41:18.000000000 -0500
++++ src/sys161.conf	2013-03-13 01:16:17.000000000 -0400
+@@ -114,22 +114,20 @@
+ #
+ 
+ #
+-# Here is a suggested default configuration: 512k RAM, two 5M disks.
++# Here is a suggested default configuration: 512k RAM, two 10M disks.
+ #
+ 
+ 0	serial
+ #0	screen
+ 
+ 1	emufs
+-
+-2	disk	rpm=7200	sectors=10240	file=DISK1.img
+-3	disk	rpm=7200	sectors=10240	file=DISK2.img
++2	disk	rpm=7200	sectors=20480	file=DISK1.img
++3	disk	rpm=7200	sectors=20480	file=DISK2.img
+ 
+ #27	nic hwaddr=1
+ 
+ 28	random	autoseed
+ 29	timer
+ 30	trace
+-31	mainboard  ramsize=1048576  cpus=1
+-#31	mainboard  ramsize=1048576  cpus=2
+-#31	mainboard  ramsize=1048576  cpus=4
++31	mainboard  ramsize=524288  cpus=1
++#31	mainboard  ramsize=4194304  cpus=1
+diff -aur ../a1-starter/src/user/bin/Makefile src/user/bin/Makefile
+--- ../a1-starter/src/user/bin/Makefile	2013-01-18 08:42:04.000000000 -0500
++++ src/user/bin/Makefile	2013-03-13 00:59:41.000000000 -0400
+@@ -5,6 +5,6 @@
+ TOP=../..
+ .include "$(TOP)/mk/os161.config.mk"
+ 
+-SUBDIRS=true false sync mkdir rmdir pwd cat cp ln mv rm ls sh
++SUBDIRS=true false sync mkdir rmdir pwd cat cp ln mv rm ls sh psh
+ 
+ .include "$(TOP)/mk/os161.subdir.mk"
+Only in src/user/bin: psh
+diff -aur ../a1-starter/src/user/sbin/Makefile src/user/sbin/Makefile
+--- ../a1-starter/src/user/sbin/Makefile	2013-01-18 08:42:01.000000000 -0500
++++ src/user/sbin/Makefile	2013-03-13 00:59:37.000000000 -0400
+@@ -5,6 +5,6 @@
+ TOP=../..
+ .include "$(TOP)/mk/os161.config.mk"
+ 
+-SUBDIRS=reboot halt poweroff 
++SUBDIRS=reboot halt poweroff mksfs dumpsfs sfsck
+ 
+ .include "$(TOP)/mk/os161.subdir.mk"
+Only in src/user/sbin: dumpsfs
+Only in src/user/sbin: mksfs
+Only in src/user/sbin: sfsck
+diff -aur ../a1-starter/src/user/testbin/Makefile src/user/testbin/Makefile
+--- ../a1-starter/src/user/testbin/Makefile	2013-01-18 08:41:54.000000000 -0500
++++ src/user/testbin/Makefile	2013-03-13 00:59:28.000000000 -0400
+@@ -9,7 +9,7 @@
+ 	dirseek dirtest f_test farm faulter filetest forkbomb forktest \
+ 	guzzle hash hog huge kitchen malloctest matmult palin parallelvm \
+ 	psort randcall rmdirtest rmtest sink sort sty tail tictac triplehuge \
+-	triplemat triplesort exittest simpleforktest killtest waittest
++	triplemat triplesort exittest simpleforktest killtest continuetest
+ 
+ # But not:
+ #    userthreads    (no support in kernel API in base system)
+diff -aur ../a1-starter/src/user/testbin/badcall/Makefile src/user/testbin/badcall/Makefile
+--- ../a1-starter/src/user/testbin/badcall/Makefile	2013-01-18 08:41:48.000000000 -0500
++++ src/user/testbin/badcall/Makefile	2013-03-13 00:59:23.000000000 -0400
+@@ -4,7 +4,6 @@
+ .include "$(TOP)/mk/os161.config.mk"
+ 
+ SRCS=\
+-	bad_kill.c \
+ 	bad_execv.c \
+ 	bad_waitpid.c \
+ 	bad_open.c \
+Only in ../a1-starter/src/user/testbin/badcall: bad_kill.c
+diff -aur ../a1-starter/src/user/testbin/badcall/driver.c src/user/testbin/badcall/driver.c
+--- ../a1-starter/src/user/testbin/badcall/driver.c	2013-01-18 08:41:48.000000000 -0500
++++ src/user/testbin/badcall/driver.c	2013-03-13 00:59:23.000000000 -0400
+@@ -186,40 +186,39 @@
+ 	const char *name;
+ 	void (*f)(void);
+ } ops[] = {
+-	{ 'a', 9, "execv",		test_execv },
++	{ 'a', 2, "execv",		test_execv },
+ 	{ 'b', 2, "waitpid",		test_waitpid },
+-	{ 'c', 4, "open",		test_open },
+-	{ 'd', 4, "read",		test_read },
+-	{ 'e', 4, "write",		test_write },
+-	{ 'f', 4, "close",		test_close },
++	{ 'c', 2, "open",		test_open },
++	{ 'd', 2, "read",		test_read },
++	{ 'e', 2, "write",		test_write },
++	{ 'f', 2, "close",		test_close },
+ 	{ 'g', 0, "reboot",		test_reboot },
+-	{ 'h', 9, "sbrk",		test_sbrk },
+-	{ 'i', 9, "ioctl",		test_ioctl },
+-	{ 'j', 4, "lseek",		test_lseek },
++	{ 'h', 3, "sbrk",		test_sbrk },
++	{ 'i', 5, "ioctl",		test_ioctl },
++	{ 'j', 2, "lseek",		test_lseek },
+ 	{ 'k', 4, "fsync",		test_fsync },
+ 	{ 'l', 4, "ftruncate",		test_ftruncate },
+ 	{ 'm', 4, "fstat",		test_fstat },
+ 	{ 'n', 4, "remove",		test_remove },
+ 	{ 'o', 4, "rename",		test_rename },
+-	{ 'p', 4, "link",		test_link },
++	{ 'p', 5, "link",		test_link },
+ 	{ 'q', 4, "mkdir",		test_mkdir },
+ 	{ 'r', 4, "rmdir",		test_rmdir },
+-	{ 's', 4, "chdir",		test_chdir },
++	{ 's', 2, "chdir",		test_chdir },
+ 	{ 't', 4, "getdirentry",	test_getdirentry },
+-	{ 'u', 9, "symlink",		test_symlink },
+-	{ 'v', 9, "readlink",		test_readlink },
+-	{ 'w', 4, "dup2",		test_dup2 },
+-	{ 'x', 9, "pipe",		test_pipe },
+-	{ 'y', 0, "__time",		test_time },
+-	{ 'z', 4, "__getcwd",		test_getcwd },
+-	{ '{', 4, "stat",		test_stat },
+-	{ '|', 4, "lstat",		test_lstat },
+-	{ '}', 2, "kill",               test_kill },
++	{ 'u', 5, "symlink",		test_symlink },
++	{ 'v', 5, "readlink",		test_readlink },
++	{ 'w', 2, "dup2",		test_dup2 },
++	{ 'x', 5, "pipe",		test_pipe },
++	{ 'y', 5, "__time",		test_time },
++	{ 'z', 2, "__getcwd",		test_getcwd },
++	{ '{', 5, "stat",		test_stat },
++	{ '|', 5, "lstat",		test_lstat },
+ 	{ 0, 0, NULL, NULL }
+ };
+ 
+ #define LOWEST  'a'
+-#define HIGHEST '}'
++#define HIGHEST '|'
+ 
+ static
+ void
+@@ -248,6 +247,7 @@
+ runit(int op)
+ {
+ 	int i, k;
++
+ 	if (op=='!') {
+ 		exit(0);
+ 	}
+diff -aur ../a1-starter/src/user/testbin/badcall/test.h src/user/testbin/badcall/test.h
+--- ../a1-starter/src/user/testbin/badcall/test.h	2013-01-18 08:41:48.000000000 -0500
++++ src/user/testbin/badcall/test.h	2013-03-13 00:59:23.000000000 -0400
+@@ -101,4 +101,3 @@
+ void test_getcwd(void);
+ void test_stat(void);
+ void test_lstat(void);		/* in bad_stat.c */
+-void test_kill(void);  /* in bad_kill.c */
+diff -aur ../a1-starter/src/user/testbin/continuetest/continuetest.c src/user/testbin/continuetest/continuetest.c
+--- ../a1-starter/src/user/testbin/continuetest/continuetest.c	2013-01-18 08:41:49.000000000 -0500
++++ src/user/testbin/continuetest/continuetest.c	2013-03-13 00:59:24.000000000 -0400
+@@ -90,7 +90,7 @@
+ }
+ 
+ int
+-main(int argc, char *argv[])
++main()
+ {
+ 	warnx("Starting.");
+ 
+diff -aur ../a1-starter/src/user/testbin/killtest/killtest.c src/user/testbin/killtest/killtest.c
+--- ../a1-starter/src/user/testbin/killtest/killtest.c	2013-01-18 08:41:41.000000000 -0500
++++ src/user/testbin/killtest/killtest.c	2013-03-13 00:59:18.000000000 -0400
+@@ -2,11 +2,6 @@
+  * killtest - test kill().
+  *
+  * This should work correctly when SIGKILL is implemented for kill().
+- * To test that children sent a KILL signal actually exit properly, this
+- * test uses waitpid to retrieve their exit status.
+- *
+- * Thus, this test really exercises the entire assignment (but not all the
+- * corner cases for waitpid)
+  */
+ 
+ #include <unistd.h>
+@@ -14,7 +9,6 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <err.h>
+-#include <signal.h>
+ 
+ /*
+  * Helper function for fork that prints a warning on error.
+@@ -33,208 +27,43 @@
+ 	}
+ 	return pid;
+ }
+-int parent;
+-
+-static
+-int 
+-dofork2(void)
+-{
+-	int pid,me,i,ret;
+-	pid = fork();
+-	if (pid < 0) {
+-		warn("fork failed.");
+-	} else if (pid == 0) {
+-		me = getpid();
+-		/* child... try to stop previous */
+-		if (me-1 != parent) {
+-			warnx("Child %d, parent %d, trying to kill %d.",me,parent,me-1);
+-			ret = kill(me-1, SIGSTOP);
+-			if (ret != 0) {
+-				warn("kill of %d from %d failed.\n",me-1,me);
+-			}
+-		}
+-		for (i = 0; i < 1000 ;i++) {
+-			printf("%d",me);
+-		}
+-		warnx("child %d done, exiting.",me);
+-		exit(me);
+-	} 
+-	return pid;
+-}
+ 
+ /*
+- * Actually run the test for signals that should cause termination.
++ * Actually run the test.
+  */
+ static
+ void
+-testsig_die(int signum, const char *signame)
++test()
+ {
+-	int pid0, ret, status;
++	int pid0, pid1, ret;
+ 
+ 	pid0 = dofork();
+-	warnx("Child %d created.",pid0);
++	warnx("Child 0 created.");
++	pid1 = dofork();
++	warnx("Child 1 created.");
+ 
+-	ret = kill(pid0, signum);
++	ret = kill(pid1, 9);
+ 	if (ret == -1) {
+ 		warn("kill failed.");
+ 	}
+ 	else {
+-		warnx("Child %d sent %s.",pid0, signame);
++		warnx("Child 1 killed.");
+ 	}
+-
+-	ret = waitpid(pid0, &status, 0);
+-	if (ret != pid0) {
+-		warn("waitpid failed (signal %s, status %d)",signame,WEXITSTATUS(status));
+-	} else {
+-		warnx("waitpid succeeded (signal %s, status %d, rawstatus %d).",signame,WEXITSTATUS(status),status);
+-		if (WIFSIGNALED(status)) {
+-			warnx("\t status indicates exit due to signal.");
+-		} else {
+-			warnx("\t status %d does NOT indicate exit due to signal.");
+-		}
+-	}
+-		
+-}
+-/*
+- * Actually run the test for signals that should be ignored.
+- */
+-static
+-void
+-testsig_ignore(int signum, const char *signame)
+-{
+-	int pid0, ret, status=123456;
+-	int i, ok=0;
+-
+-	pid0 = dofork();
+-	warnx("Child %d created.",pid0);
+-
+-	ret = kill(pid0, signum);
++	ret = kill(pid0, 9);
+ 	if (ret == -1) {
+ 		warn("kill failed.");
+ 	}
+ 	else {
+-		warnx("Child %d sent %s.",pid0,signame);
+-	}
+-
+-	/* check repeatedly to make sure signaled child is still there */
+-	for (i=0; i < 100; i++) {
+-		ret = waitpid(pid0, &status, WNOHANG);
+-		if (ret != 0) {
+-			warn("waitpid with WNOHANG failed (%s)",signame);
+-		} else {
+-			ok++;
+-		}
+-	}
+-	if (ok == 100) {
+-		warnx("Success: signal %s appears to be ignored.",signame);
++		warnx("Child 0 killed.");
+ 	}
+-
+-	/* try killing child just to clean up */
+-	warnx("Sending SIGKILL to Child %d to clean up...",pid0);
+-	ret = kill(pid0, SIGKILL);
+-	if (ret == -1) {
+-		warn("kill failed.");
+-	}
+-	ret = waitpid(pid0, &status, 0);
+-	warnx("\tretrieved %d status from pid %d\n",status,pid0);
+ }
+ 
+-/* Test ability to signal non-child (siblings or parent */
+-
+-static
+-void
+-testsig_circle()
+-{
+-	int pid1, pid2, pid3, pid4;
+-	int i, ret, status, realstatus;
+-
+-	parent = getpid();
+-	warnx("circular stop and continue test, parent has pid %d.",parent);
+-	pid1 = dofork2();
+-	if (pid1 < 0) {
+-		warn("fork failed.");
+-	}
+-	pid2 = dofork2();
+-	if (pid2 < 0) {
+-		warn("fork failed.");
+-	}
+-	pid3 = dofork2();
+-	if (pid3 < 0) {
+-		warn("fork failed.");
+-	}
+-	pid4 = dofork2();
+-	if (pid4 < 0) {
+-		warn("fork failed.");
+-	}
+-
+-	/* parent... keep busy for a while, then continue children */
+-	for (i=0; i < 1000000; i++)
+-		ret = random();
+-
+-	warnx("Continuing child %d.",pid3);
+-	ret = kill(pid3, SIGCONT);
+-
+-	for (i=0; i < 1000000; i++) 
+-		ret = random();
+-
+-	warnx("Continuing child %d.",pid2);
+-	ret = kill(pid2, SIGCONT);
+- 
+-	for (i=0; i < 1000000; i++)
+-		ret = random();
+-	
+-	warnx("Continuing child %d.",pid1);
+-	ret = kill(pid1, SIGCONT);
+-
+-
+-	/* Get exitstatus from children */
+-	warnx("Getting exitstatus from %d.",pid1);
+-	ret = waitpid(pid1, &status, 0);
+-	realstatus = WEXITSTATUS(status);
+-	if (realstatus != pid1) {
+-		warn("Got status %d, expected %d.",realstatus,pid1);
+-	}
+-
+-	warnx("Getting exitstatus from %d.",pid2);
+-	ret = waitpid(pid2, &status, 0);
+-	realstatus = WEXITSTATUS(status);
+-	if (realstatus != pid2) {
+-		warn("Got status %d, expected %d.",realstatus,pid2);
+-	}
+-	
+-	warnx("Getting exitstatus from %d.",pid3);
+-	ret = waitpid(pid3, &status, 0);
+-	realstatus = WEXITSTATUS(status);
+-	if (realstatus != pid3) {
+-		warn("Got status %d, expected %d.",realstatus,pid3);
+-	}
+-
+-	warnx("Getting exitstatus from %d.",pid4);
+-	ret = waitpid(pid4, &status, 0);
+-	realstatus = WEXITSTATUS(status);
+-	if (realstatus != pid4) {
+-		warn("Got status %d, expected %d.",realstatus,pid4);
+-	}
+-
+-}
+-
+-
+ int
+ main()
+ {
+ 	warnx("Starting.");
+ 
+-	/* Test signals that should cause termination. */ 
+-	testsig_die(SIGHUP, "SIGHUP");
+-	testsig_die(SIGINT, "SIGINT");
+-	testsig_die(SIGKILL, "SIGKILL");
+-	testsig_die(SIGTERM, "SIGTERM");
+-	/* test signals that should be ignored */
+-	testsig_ignore(SIGWINCH, "SIGWINCH");
+-	testsig_ignore(SIGINFO, "SIGINFO");
+-
+-	/* test stop and continue behavior? */
+-	testsig_circle();
++	test();
+ 
+ 	warnx("Complete.");
+ 	return 0;
+Only in ../a1-starter/src/user/testbin: waittest
